@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Baby monitor</title>
+<style>
+  body { font: 1rem system-ui, sans-serif; max-width: 31rem; margin: 3rem auto; padding: 0 1rem; }
+  button { font: inherit; min-height: 2.75rem; padding: .5rem 1rem; }
+  video { display: block; width: 100%; margin: 1rem 0; aspect-ratio: 16 / 9; background: #111; }
+</style>
+<h1>Baby monitor</h1>
+<button id="listen">Start monitor</button>
+<button id="stop" disabled>Stop</button>
+<video id="audio" controls autoplay playsinline aria-label="Live camera and room audio"></video>
+<p id="status" role="status">Idle</p>
+<script>
+  const listen = document.querySelector("#listen");
+  const stop = document.querySelector("#stop");
+  const audio = document.querySelector("#audio");
+  const status = document.querySelector("#status");
+  let peer, timer;
+
+  // location.origin also works when the page was opened with HTTP Basic credentials in its URL.
+  const endpoint = path => new URL(path, location.origin);
+
+  function reset(message) {
+    clearTimeout(timer);
+    const previous = peer;
+    peer = null;
+    previous?.close();
+    audio.srcObject = null;
+    listen.disabled = false;
+    stop.disabled = true;
+    status.textContent = message;
+  }
+
+  async function waitForIce(current) {
+    if (current.iceGatheringState === "complete") return;
+    await new Promise((resolve, reject) => {
+      const deadline = setTimeout(() => finish(new Error("Could not gather WebRTC network addresses")), 8000);
+      function finish(error) {
+        clearTimeout(deadline);
+        current.removeEventListener("icegatheringstatechange", check);
+        if (error) reject(error);
+        else resolve();
+      }
+      function check() {
+        if (current.iceGatheringState === "complete") finish();
+      }
+      current.addEventListener("icegatheringstatechange", check);
+      check();
+    });
+  }
+
+  listen.onclick = async () => {
+    listen.disabled = true;
+    stop.disabled = false;
+    status.textContent = "Connecting…";
+    let current;
+    try {
+      current = peer = new RTCPeerConnection({iceServers: []});
+      current.addTransceiver("audio", {direction: "recvonly"});
+      current.addTransceiver("video", {direction: "recvonly"});
+      const sourceState = {audio: false, video: false};
+      const statusChannel = current.createDataChannel("monitor-status");
+      function showMediaStatus() {
+        if (peer !== current || current.connectionState !== "connected") return;
+        const ready = [];
+        if (sourceState.video && audio.videoWidth) ready.push("Camera live");
+        if (sourceState.audio) ready.push("Mic live");
+        if (!sourceState.video || !audio.videoWidth) ready.push("Waiting for camera");
+        if (!sourceState.audio) ready.push("Waiting for mic");
+        if (audio.paused && audio.srcObject?.getTracks().length) ready.push("Press Play");
+        status.textContent = ready.join(" · ");
+      }
+      statusChannel.onmessage = ({data}) => {
+        Object.assign(sourceState, JSON.parse(data));
+        showMediaStatus();
+      };
+      audio.onresize = showMediaStatus;
+      audio.onloadeddata = showMediaStatus;
+      const media = new MediaStream();
+      audio.srcObject = media;
+      current.ontrack = ({track}) => {
+        if (peer !== current) return;
+        media.addTrack(track);
+        audio.play().catch(() => {
+          if (peer === current) status.textContent = "Press Play to start";
+        });
+      };
+      audio.onplaying = showMediaStatus;
+      current.onconnectionstatechange = () => {
+        if (peer !== current) return;
+        clearTimeout(timer);
+        if (current.connectionState === "connected") {
+          showMediaStatus();
+        } else if (current.connectionState === "disconnected") {
+          status.textContent = "WebRTC connection interrupted…";
+          timer = setTimeout(() => {
+            if (peer === current) reset("WebRTC disconnected. Press Start monitor to reconnect.");
+          }, 6000);
+        } else if (["failed", "closed"].includes(current.connectionState)) {
+          reset("WebRTC disconnected. Press Start monitor to reconnect.");
+        }
+      };
+      await current.setLocalDescription(await current.createOffer());
+      await waitForIce(current);
+      if (peer !== current) return;
+      const response = await fetch(endpoint("/offer"), {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify(current.localDescription)
+      });
+      if (!response.ok) throw new Error(await response.text());
+      if (peer !== current) return;
+      await current.setRemoteDescription(await response.json());
+    } catch (error) {
+      if (peer === current || !current) reset(error.message);
+    }
+  };
+
+  stop.onclick = () => {
+    reset("Stopped");
+    fetch(endpoint("/stop"), {method: "POST", keepalive: true}).catch(() => {});
+  };
+</script>
+</html>
